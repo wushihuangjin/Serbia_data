@@ -1,0 +1,468 @@
+# 加载包
+library(tidyverse)
+library(zoo)
+library(minpack.lm)
+setwd("C:/Users/吴佳琪/Desktop/数据合并/算最大值和最小值")
+# 1. 读取原始长数据
+#都算完了，又根据merged_data 一些列的情况删除了不对的数据，删除过程见代码底部
+library(readxl) 
+df_long <- read_xlsx("df_long_第二波数据.xlsx")
+table(df_long$Speaker)
+str(df_long)
+# ====================== 1. 读取并重塑数据（长表转宽表：每个token一行，100个F0列） ======================
+tone_sequence <- c(
+  "Tone1", "Tone2", "Tone3", "Tone4")
+df_long$Tone <- rep(tone_sequence, each = 20, times= 119)
+
+df_long <- df_long %>%
+  mutate(
+    token_id = paste(Speaker, Tone, vowel, sep = "_")
+  )
+
+str(df_long)
+df_long$F0 <- as.numeric(df_long$F0)
+token <- data.frame(table(df_long$token_id))
+
+
+# 长格式 → 宽格式：每行一个token，F0_0 ~ F0_99 100列
+# 4. 转为宽格式（后续计算声学参数用）
+#有的数据N》1不能宽化。必须先去重
+df_long %>%
+  count(Speaker, Tone, Label, token_id, Point) %>%
+  filter(n > 1)
+
+library(reshape2)
+
+
+df_wide <- df_long %>%
+  select(Speaker, Tone, Label, token_id, Point, F0) %>%
+  # 先去重：同一组只保留1条；根据你的研究需求选择保留第一条/均值
+  group_by(Speaker, Tone, Label, token_id, Point) %>%
+  slice(1) %>%   # 重复时取第一条；如果你想要均值换成 summarise(F0 = mean(F0,na.rm=T))
+  ungroup() %>%
+  dcast(
+    Speaker + Tone + Label + token_id ~ Point,
+    value.var = "F0"
+  )
+
+
+# 获取全部列名
+old_names <- colnames(df_wide)
+# 前三列保持原名，4列及以后加前缀F0_
+new_names <- c(
+  old_names[1:4],
+  paste0("F0_", old_names[5:length(old_names)])
+)
+# 批量重命名
+df_wide <- set_names(df_wide, new_names)
+
+
+library(writexl)
+write_xlsx(df_wide,"给佳琪添加speakerAug06.xlsx")
+
+# ====================== 2. 文献公式自定义计算函数 ======================
+data_wide <- read_xlsx("给佳琪添加speakerAug06.xlsx")
+
+data_wide <- df_wide
+# 五度值转换 -------------------------------------------------------------------
+# 提取所有F0列名（F0_1 ~ F0_100）
+f0_cols <- str_subset(colnames(data_wide), "^F0_")
+library(tidyverse)
+library(dplyr)
+# 1. 按Speaker分组，计算每个说话人全局F0的min/max
+# 1. 宽表转长格式
+long_df <- pivot_longer(data_wide, cols = all_of(f0_cols), names_to = "Point", values_to = "F0")
+# 2. 按Speaker拆分成列表
+spk_list <- split(long_df, long_df$Speaker)
+# 3. 循环计算每个说话人极值
+speaker_extremes <- lapply(spk_list, function(sub_df){
+  tibble(
+    Speaker = unique(sub_df$Speaker),
+    spk_min = min(sub_df$F0, na.rm = TRUE),
+    spk_max = max(sub_df$F0, na.rm = TRUE)
+  )
+}) %>% bind_rows()
+
+# 2. 把极值合并回原宽表，每行都带上对应说话人的min/max
+data_wide_with_range <- left_join(data_wide, speaker_extremes, by = "Speaker")
+
+# 3. 批量对所有F0列做归一化，生成Norm_F0_1~Norm_F0_100
+data_wide_norm <- data_wide_with_range %>%
+  mutate(
+    across(all_of(f0_cols),
+      ~ 5 * (log10(.x) - log10(spk_min)) / (log10(spk_max) - log10(spk_min))
+    )
+  )
+#数据有些错行，让佳琪处理一下
+write_xlsx(data_wide_norm,"data_wide_norm-第一波Serbia和母语者.xlsx")
+
+
+#data_wide_norm <- data_wide_norm %>%
+  #select(-starts_with("F0_"))
+
+# ##笨办法计算
+# library(tidyverse)
+# data_long <- data_long %>%
+#   mutate(
+#     Tvalue = 5 * (log10(F0) - log10(spk_min)) / (log10(spk_max) - log10(spk_min))
+#   )
+# 
+# library(reshape2)
+# library(tidyverse)
+# 
+# data_wide_with_norm <- data_long %>%
+#   pivot_wider(
+#     names_from = Point,
+#     values_from = c(F0, Tvalue),
+#     names_sep = "_"
+#   )
+
+library(tidyverse)
+library(minpack.lm)
+
+data_wide_norm <- read_xlsx("data_wide_norm-第一波Serbia和母语者.xlsx")
+
+#用data_wide_norm计算下面的参数
+
+# 2.2 抛物线拟合提取 mean / slope / curve（公式2） -----------------------------------
+
+# ==========================================
+# 1. 定义单个向量的线索提取函数
+# ==========================================
+extract_tone_cues <- function(T_vec) {
+  # 确保向量无全 NA 且长度足够
+  if (all(is.na(T_vec)) || length(na.omit(T_vec)) < 10) {
+    return(tibble(
+      mean = NA_real_, slope = NA_real_, curve = NA_real_,
+      BLstart = NA_real_, BLslope1 = NA_real_, BLbreakpoint = NA_real_, BLslope2 = NA_real_,
+      onglide = NA_real_, offglide = NA_real_, overall = NA_real_
+    ))
+  }
+  
+  N <- length(T_vec)
+  t <- seq(0, 1, length.out = N)
+  
+  # ----------------------------------------
+  # A. Parabolic Fit (公式 2 移位勒让德多项式)
+  # ----------------------------------------
+  p1 <- t - 0.5
+  p2 <- (t - 0.5)^2 - (1 / 12)
+  
+  fit_poly <- lm(T_vec ~ p1 + p2)
+  coefs_poly <- coef(fit_poly)
+  
+  c0 <- unname(coefs_poly["(Intercept)"])
+  c1 <- unname(coefs_poly["p1"])
+  c2 <- unname(coefs_poly["p2"])
+  
+  # ----------------------------------------
+  # B. Broken-line Fit (遍历 d2 线性优化)
+  # ----------------------------------------
+  best_error <- Inf
+  best_params <- NULL
+  
+  # 遍历断点位置 d2 (0.1 ~ 0.9)
+  for (d2_cand in seq(0.1, 0.9, by = 0.01)) {
+    x1 <- pmin(t, d2_cand)
+    x2 <- pmax(0, t - d2_cand)
+    
+    fit_bl <- tryCatch(
+      lm(T_vec ~ x1 + x2),
+      error = function(e) NULL
+    )
+    
+    if (is.null(fit_bl)) next
+    
+    err <- sum(resid(fit_bl)^2)
+    if (err < best_error) {
+      best_error <- err
+      coefs_bl <- coef(fit_bl)
+      best_params <- list(
+        d0 = coefs_bl["(Intercept)"],
+        d1 = coefs_bl["x1"],
+        d2 = d2_cand,
+        d3 = coefs_bl["x2"]
+      )
+    }
+  }
+  
+  if (!is.null(best_params)) {
+    d0 <- unname(best_params$d0)
+    d1 <- unname(best_params$d1)
+    d2 <- unname(best_params$d2)
+    d3 <- unname(best_params$d3)
+    
+    f0_onset  <- d0
+    f0_break  <- d0 + d1 * d2
+    f0_offset <- d0 + d1 * d2 + d3 * (1 - d2)
+    
+    # 按照文献定义的差值 (Difference)
+    onglide  <- f0_onset - f0_break
+    offglide <- f0_break - f0_offset
+    overall  <- f0_onset - f0_offset
+  } else {
+    d0 <- d1 <- d2 <- d3 <- onglide <- offglide <- overall <- NA_real_
+  }
+  
+  # ----------------------------------------
+  # C. 返回包含所有参数的单行 Tibble
+  # ----------------------------------------
+  return(tibble(
+    mean = c0,
+    slope = c1,
+    curve = c2,
+    BLstart = d0,
+    BLslope1 = d1,
+    BLbreakpoint = d2,
+    BLslope2 = d3,
+    onglide = onglide,
+    offglide = offglide,
+    overall = overall
+  ))
+}
+
+# ==========================================
+# 2. 应用到你的宽格式数据数据框 data_wide_norm
+# ==========================================
+
+# 提取所有 F0 列的数据（匹配 F0_ 开头的列）
+f0_result <- data_wide_norm %>% 
+  select(starts_with("F0_")) %>% 
+  as.matrix()
+
+# 逐行调用计算函数并合并回原数据框
+cues_results <- apply(f0_result, 1, extract_tone_cues) %>% 
+  bind_rows()
+
+# 拼接到原有数据集上
+data_with_cues <- bind_cols(data_wide_norm, cues_results)
+write_xlsx(data_with_cues,"f0_result1.xlsx")
+# 查看提取出的 Cue 2 ~ Cue 11 参数
+head(data_with_cues %>% select(mean:overall))
+# 
+# # 验证slope和curve -----------------------------------------------------------
+# 
+# thislabel <- data_wide_norm %>%
+#   slice(161) %>% # 选取第1行
+#   select(starts_with("F0_"))
+# long_df <- pivot_longer(thislabel, cols = all_of(f0_cols), names_to = "Point", values_to = "F0")
+# long_df$TP <- seq(0, 1, length.out = 100)
+# long_df$TP2 <-long_df$TP^2
+# 
+# quadraticModel <- lm(F0 ~ TP+TP2, data=long_df)
+# Curve <- quadraticModel$coefficients[3]
+# Slope<- quadraticModel$coefficients[2]
+# 
+# thislabel <- subset(data_wide_norm,token_id=="Neutral_Tone4_318_i")t# 点位取值强制标量
+#   f0onset <- as.numeric(T_vec[1])
+#   f025    <- as.numeric(T_vec[25])
+#   f050    <- as.numeric(T_vec[50])
+#   f075    <- as.numeric(T_vec[75])
+#   f0offset<- as.numeric(T_vec[100])
+#   max_pos <- as.numeric(which.max(T_vec))
+#   min_pos <- as.numeric(which.min(T_vec))
+#   data_wide_norm[i,109]=f0range
+#   data_wide_norm[i,110]=f0onset
+#   data_wide_norm[i,111]=f025
+#   data_wide_norm[i,112]=f050
+#   data_wide_norm[i,113]=f075
+#   data_wide_norm[i,114]=f0offset
+#   data_wide_norm[i,115]=max_pos
+#   data_wide_norm[i,116]=min_pos
+# }
+# long_df <- pivot_longer(thislabel, cols = all_of(f0_cols), names_to = "Point", values_to = "F0")
+# long_df$TP <- seq(0, 1, length.out = 100)
+# ggplot(long_df,aes(x=TP,y=F0))+geom_point()
+# 
+# check <- data_wide[500,]
+# 
+#  
+# 
+# #  2.3 Broken-line分段折线拟合BL系列参数（cue5~cue11） ------------------------------------------------
+# 
+# f0$TP <- f0$Point
+# f0$TP2 <- f0$Point^2
+# f0$index <- paste(f0$Speaker,f0$vowel,f0$Tone,sep = "-")
+# index <- f0$index
+# 
+# for (i in 1:length(index)) {
+#   thisdata <- f0[which(f0$index==index[i]),]
+#   broken.model <- lm(Tvalue ~ TP,data = thisdata)
+#   seg.broken <- segmented(broken.model, seg.Z = ~TP)
+#   pred <- predict(seg.broken, data.frame(TP = 1:100))
+#   p=1
+#   while (isTRUE(pred[p+1]-pred[p]<=0)){
+#     p=p+1
+#   }
+#   f0[i,14] = p
+# }
+# names(f0)[14] <- "Location"
+# 
+# ##计算完了发现有极端值，找出来location不正常小的看看
+# outlier_early <- subset(f0,Location<=30)
+# Outlier_late <- subset(f0,Location>75)
+# outlier_index <- unique(outlier_early$interval)
+# 
+# check <- subset(f0,f0$index==outlier_index[1])
+#library(tidyverse)
+
+# # 宽表转长表，固定标识列不动，其余全部拉长
+# check_long <- data_wide_with_range %>%
+#   pivot_longer(
+#     cols = -c(Emotion, Tone, Interval, Vowel, Speaker, spk_min, spk_max),
+#     names_to = "Point",   # 原列名（F0_1/F0_2...）存入该列
+#     values_to = "F0"      # 对应音高数值存入该列
+#   )
+# broken.model <- lm(Tvalue ~ TP,data = check)
+# seg.broken <- segmented(broken.model, seg.Z = ~TP)
+# pred <- predict(seg.broken, data.frame(TP = 1:20))
+# checkdata <- as.data.frame(pred)
+# checkdata$Point <- c(1:20)
+# ggplot(checkdata,aes(x=Point,y = pred))+geom_point()
+# 
+# check_location <- subset(f0,index==outlier_index[25])
+# mean(check_location$Location)
+# 
+# check_original <- subset(f0,index==outlier_index[24])
+# ggplot(check_original,aes(x=Point,y = Tvalue))+geom_point()
+# 
+# outlier_index[25]
+
+
+
+
+
+
+# ## 2.4 百分比点位、极值F0线索（cue12~cue19） ----------------------------------------
+
+for(i in 1:nrow(data_wide_norm)){
+  T_vec <- data.frame(data_wide_norm[i,c(5:24)])
+  f0_max <- max(T_vec)
+  f0_min <- min(T_vec)
+  f0range <- f0_max - f0_min
+  
+  # 点位取值强制标量
+  f0onset <- as.numeric(T_vec[1])
+  f025    <- as.numeric(T_vec[5])
+  f050    <- as.numeric(T_vec[10])
+  f075    <- as.numeric(T_vec[15])
+  f0offset<- as.numeric(T_vec[20])
+  max_pos <- as.numeric(which.max(T_vec))
+  min_pos <- as.numeric(which.min(T_vec))
+  data_wide_norm[i,27]=f0range
+  data_wide_norm[i,28]=f0onset
+  data_wide_norm[i,29]=f025
+  data_wide_norm[i,30]=f050
+  data_wide_norm[i,31]=f075
+  data_wide_norm[i,32]=f0offset
+  data_wide_norm[i,33]=max_pos
+  data_wide_norm[i,34]=min_pos
+  data_wide_norm[i, 35] <- f0_max   # 新增
+  data_wide_norm[i, 36] <- f0_min   # 新增
+}
+
+colnames(data_wide_norm)[27:36] <- c(
+  "f0range",
+  "f0onset",
+  "f025",
+  "f050",
+  "f075",
+  "f0offset",
+  "max_pos",
+  "min_pos",
+  "f0_max",   # 新增
+  "f0_min"    # 新增
+)
+write_xlsx(data_wide_norm,"f0_result2.xlsx")
+# ====================== 3. 批量逐token计算全部F0声学线索 ======================
+
+
+
+
+# 方法一：dplyr 方式（推荐）
+library(dplyr)
+
+# 找出两个表共有的列名（除 token_id 外）
+common_cols <- intersect(names(data_wide_norm), names(data_with_cues))
+common_cols <- setdiff(common_cols, "token_id")  # 去掉合并键
+
+# 只保留 data_wide_norm 中的重复列，删除 data_with_cues 中的重复列
+data_with_cues_trim <- data_with_cues %>% 
+  select(-all_of(common_cols))
+
+# 按 token_id 左连接合并
+merged_data <- left_join(data_wide_norm, data_with_cues_trim, by = "token_id")
+
+write_xlsx(merged_data,"f0_result_all.xlsx")
+getwd()
+
+
+
+
+##开始手动修改merged_data里不对的音频的F0值
+library(tidyverse)
+tocheck <- merged_data %>%
+  filter(
+      (Tone == "Tone 2" & onglide < 0) |
+      (Tone == "Tone 3" & onglide < 0)
+  )
+# ========== 1. 筛选目标token_id + 宽转长 ==========
+plot_data <- merged_data %>%
+  filter(token_id == tocheck$token_id[4]) %>%  # 改成你想要的token_id
+  pivot_longer(
+    cols = starts_with("F0_"),
+    names_to = "Point",
+    names_prefix = "F0_",   # 去掉前缀F0_，只剩下数字
+    values_to = "F0"
+  ) %>%
+  mutate(Point = as.numeric(Point)) # 转为数值，坐标轴顺序正常
+
+# ========== 2. 绘图：只有散点geom_point ==========
+ggplot(plot_data, aes(x = Point, y = F0)) +
+  geom_point(size = 3, color = "darkred") +
+  labs(
+    x = "Normalized Point",
+    y = "Normalized F0",
+    title = paste0("F0 trajectory: ", unique(plot_data$token_id))
+  ) +
+  theme_bw()
+
+
+library(dplyr)
+
+df_long <- df_long %>%
+  mutate(
+    F0_revised = ifelse(
+      (token_id == tocheck$token_id[1] & Point <=2),
+      NA,
+      F0_revised
+    )
+  )
+
+#要两端删除
+df_long <- df_long %>%
+  mutate(
+    F0_revised = ifelse(
+      token_id == tocheck$token_id[28] & Point >= 9 & Point <= 17,
+      NA,
+      F0_revised
+    )
+  )
+# 59不要了 
+
+#df_long <- df_long %>%
+#filter(-token_id==tocheck$token_id[4])
+
+toverify <- df_long %>%
+  filter(is.na(F0_revised))
+
+tocheck$token_id[2]
+print("F0声学特征计算完成，文件：f0_result_all.xlsx")
+
+##用于删除多处point的情况
+(token_id == tocheck$token_id[46] & Point <= 2)|
+  (token_id == tocheck$token_id[46] & Point > 12),
+
+##删除一条数据
+df_long <- df_long %>%
+  filter(token_id != tocheck$token_id[86])
